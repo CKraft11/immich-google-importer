@@ -10,7 +10,8 @@ It's made for the "everyone dumps their trip photos into one shared Google album
 - **Original quality.** Full-resolution photos and original videos, with their original capture dates.
 - **"Taken by" credits.** Each photo's Immich description is set to `Taken by <name>` using the contributor shown in the shared album. Existing descriptions are never overwritten.
 - **Re-sync when people add more.** Imported albums are remembered, so a later sync only downloads the new photos and adds them to the same Immich album. It also fills in missing "Taken by" credits on photos imported earlier.
-- **One-tap "check all saved albums"** button, plus per-album Sync and Forget.
+- **Album grid like Immich's.** Saved albums show their Immich cover photo; tap one to open it in Immich. There's a one-tap **Sync all** button, plus per-album Sync and Forget.
+- **Looks like Immich.** Same colors, light/dark mode and icons as the Immich web app, and it works well on a phone.
 - **Preview** an album's contents without importing anything.
 - **No duplicates.** Immich de-duplicates by checksum, so re-importing is safe.
 - Python standard library only; no dependencies.
@@ -23,7 +24,9 @@ You need Docker and a running Immich server.
 
 In Immich: **Account Settings → API Keys → New API Key**. Give it these permissions (or "All"):
 
-`asset.upload`, `asset.read`, `asset.update`, `album.create`, `album.read`, `albumAsset.create`
+`asset.upload`, `asset.read`, `asset.update`, `asset.view`, `album.create`, `album.read`, `albumAsset.create`
+
+(`asset.view` is only used to show album cover thumbnails.)
 
 Photos are imported into the library of the user who owns the key.
 

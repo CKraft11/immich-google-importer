@@ -420,117 +420,284 @@ sync_lock = threading.Lock()
 
 def sync_saved(album_ids=None):
     """Re-check saved albums one at a time (in the background) for newly added photos."""
+    if not sync_lock.acquire(blocking=False):
+        return  # a sync is already running
+
     def worker():
-        with sync_lock:
+        try:
             for album_id, entry in load_state().items():
                 if (album_ids is None or album_id in album_ids) and entry.get("link"):
                     job = start_job(entry["link"], "", False)
                     while not job["finished"]:
                         time.sleep(1)
+        finally:
+            sync_lock.release()
     threading.Thread(target=worker, daemon=True).start()
 
 
 # ------------------------------------------------------------------------- web
+# Styled after the Immich web app: its colors, rounded surfaces, Material Design Icons and
+# album grid. Thumbnails and the logo are proxied from Immich so the API key stays server-side.
 
-PAGE = """<!doctype html><html><head><meta charset="utf-8">
+IMMICH_PUBLIC = (os.environ.get("IMMICH_PUBLIC_URL") or IMMICH_URL).rstrip("/")
+UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+# Material Design Icons (the set Immich uses)
+ICONS = {
+    "sync": "M12,18A6,6 0 0,1 6,12C6,11 6.25,10.03 6.7,9.2L5.24,7.74C4.46,8.97 4,10.43 4,12A8,8 0 0,0 12,20V23L16,19L12,15M12,4V1L8,5L12,9V6A6,6 0 0,1 18,12C18,13 17.75,13.97 17.3,14.8L18.76,16.26C19.54,15.03 20,13.57 20,12A8,8 0 0,0 12,4Z",
+    "close": "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z",
+    "open": "M14,3V5H17.59L7.76,14.83L9.17,16.24L19,6.41V10H21V3M19,19H5V5H12V3H5C3.89,3 3,3.9 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19V12H19V19Z",
+    "eye": "M12,9A3,3 0 0,1 15,12A3,3 0 0,1 12,15A3,3 0 0,1 9,12A3,3 0 0,1 12,9M12,4.5C17,4.5 21.27,7.61 23,12C21.27,16.39 17,19.5 12,19.5C7,19.5 2.73,16.39 1,12C2.73,7.61 7,4.5 12,4.5M3.18,12C4.83,15.36 8.24,17.5 12,17.5C15.76,17.5 19.17,15.36 20.82,12C19.17,8.64 15.76,6.5 12,6.5C8.24,6.5 4.83,8.64 3.18,12Z",
+    "download": "M2 12H4V17H20V12H22V17C22 18.11 21.11 19 20 19H4C2.9 19 2 18.11 2 17V12M12 15L17.55 9.54L16.13 8.13L13 11.25V2H11V11.25L7.88 8.13L6.46 9.55L12 15Z",
+    "image": "M8.5,13.5L11,16.5L14.5,12L19,18H5M21,19V5C21,3.89 20.1,3 19,3H5A2,2 0 0,0 3,5V19A2,2 0 0,0 5,21H19A2,2 0 0,0 21,19Z",
+}
+
+
+def icon(name, size=20):
+    return (f'<svg class="mdi" width="{size}" height="{size}" viewBox="0 0 24 24" aria-hidden="true">'
+            f'<path fill="currentColor" d="{ICONS[name]}"/></svg>')
+
+
+def pill(text, kind=""):
+    return f'<span class="pill {kind}">{html.escape(text)}</span>'
+
+
+def thumb(asset_id, cls):
+    if not asset_id:
+        return f'<div class="{cls} empty">{icon("image", 32)}</div>'
+    return f'<img class="{cls}" src="/thumb/{asset_id}" alt="" loading="lazy">'
+
+
+_covers = {"t": 0, "map": {}}
+
+
+def album_covers():
+    """Immich album id -> cover asset id, refreshed at most every 30 s."""
+    if time.time() - _covers["t"] > 30:
+        _covers["t"] = time.time()
+        try:
+            _covers["map"] = {a["id"]: a.get("albumThumbnailAssetId") for a in immich("GET", "/albums") or []}
+        except Exception:
+            pass  # keep the last known covers
+    return _covers["map"]
+
+
+PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Google Photos → Immich</title>{refresh}
+<meta name="color-scheme" content="light dark">
+<title>Google Photos Importer</title>
+<link rel="icon" href="/logo">
 <style>
-:root{{color-scheme:light dark;--bg:#f6f7f9;--card:#fff;--fg:#1b1d21;--mute:#6b7280;--acc:#4250af;--bd:#e3e5ea}}
-@media (prefers-color-scheme:dark){{:root{{--bg:#111318;--card:#1b1e25;--fg:#e8eaee;--mute:#9aa1ad;--acc:#8c9cff;--bd:#2b2f38}}}}
-body{{margin:0;background:var(--bg);color:var(--fg);font:16px/1.45 system-ui,sans-serif;padding:16px}}
-main{{max-width:640px;margin:auto}} h1{{font-size:1.3rem;margin:.2em 0 .8em}}
-.card{{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:16px;margin-bottom:14px}}
-label{{display:block;font-size:.85rem;color:var(--mute);margin:.6em 0 .25em}}
-input[type=url],input[type=text]{{width:100%;box-sizing:border-box;padding:12px;font-size:16px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--fg)}}
-.row{{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}}
-button{{flex:1;padding:12px;font-size:16px;border-radius:8px;border:1px solid var(--acc);background:var(--acc);color:#fff;font-weight:600}}
-button.alt{{background:transparent;color:var(--acc)}}
-.bar{{height:8px;background:var(--bd);border-radius:4px;overflow:hidden;margin:8px 0}} .bar i{{display:block;height:100%;background:var(--acc)}}
-.mute{{color:var(--mute);font-size:.85rem}} .err{{color:#d33}} a{{color:var(--acc)}}
-details{{margin-top:6px}} code{{font-size:.8rem;word-break:break-all}}
-.album{{display:flex;align-items:center;gap:8px;padding:10px 0;border-top:1px solid var(--bd)}}
-.album div{{flex:1;min-width:0}} .album form{{margin:0}}
-.album button{{flex:none;padding:6px 10px;font-size:.85rem;font-weight:500}}
-</style></head><body><main>
-<h1>Google Photos → Immich</h1>
+:root{--bg:#fff;--fg:#000;--muted:#6b7280;--surface:#f5f5f5;--border:#e5e5e5;--input:#fff;--input-border:#d4d4d4;
+--primary:rgb(66 80 175);--on-primary:#fff;--primary-soft:rgb(66 80 175/.12);--success:#15803d;--success-soft:#dcfce7;
+--danger:#dc2626;--danger-soft:#fddede;--warning:#b45309;--warning-soft:#fef3c7}
+@media (prefers-color-scheme:dark){:root{--bg:rgb(10 10 10);--fg:rgb(229 231 235);--muted:#a1a1a1;--surface:rgb(33 33 33);
+--border:#2e2e2e;--input:#171717;--input-border:#3d3d3d;--primary:rgb(172 203 250);--on-primary:rgb(33 33 33);
+--primary-soft:rgb(172 203 250/.14);--success:#4ade80;--success-soft:rgb(74 222 128/.14);--danger:#fa6967;
+--danger-soft:rgb(250 105 103/.14);--warning:#fbbf24;--warning-soft:rgb(251 191 36/.14)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 "GoogleSans","Google Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+a{color:var(--primary);text-decoration:none}
+.mdi{flex:none;vertical-align:middle}
+header{position:sticky;top:0;z-index:5;display:flex;align-items:center;gap:12px;height:64px;padding:0 16px;
+background:var(--bg);border-bottom:1px solid var(--border)}
+header img{width:32px;height:32px}
+header h1{flex:1;margin:0;font-size:20px;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+main{max-width:960px;margin:0 auto;padding:24px 16px 48px}
+h2{margin:0;font-size:14px;font-weight:600;letter-spacing:.02em;text-transform:uppercase;color:var(--primary)}
+section{margin-bottom:32px}
+.head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:14px}
+.card{background:var(--surface);border-radius:24px;padding:20px}
+label{display:block;font-size:14px;font-weight:500;margin:0 0 6px}
+.hint{font-weight:400;color:var(--muted)}
+input[type=url],input[type=text]{width:100%;margin-bottom:16px;padding:12px 14px;font:inherit;font-size:16px;color:var(--fg);
+background:var(--input);border:1px solid var(--input-border);border-radius:12px;outline:none}
+input:focus{border-color:var(--primary);box-shadow:0 0 0 1px var(--primary)}
+.row{display:flex;gap:10px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:10px 18px;font:inherit;font-weight:500;
+border-radius:12px;border:1px solid var(--primary);background:var(--primary);color:var(--on-primary);cursor:pointer}
+.btn.ghost{background:transparent;color:var(--primary)}
+.btn.sm{padding:6px 14px;font-size:14px}
+.btn:disabled{opacity:.6;cursor:default}
+.row .btn{flex:1 1 140px}
+.icon-btn{display:inline-flex;align-items:center;justify-content:center;width:36px;height:36px;padding:0;border:0;
+border-radius:50%;background:transparent;color:var(--muted);cursor:pointer}
+.icon-btn:hover{background:var(--primary-soft);color:var(--primary)}
+form{margin:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:20px 16px}
+@media (max-width:420px){.grid{grid-template-columns:1fr 1fr}}
+.cover{display:block;width:100%;aspect-ratio:1;object-fit:cover;border-radius:12px;background:var(--surface)}
+.cover.empty,.jthumb.empty{display:flex;align-items:center;justify-content:center;color:var(--muted)}
+.album{position:relative;min-width:0}
+a.cover-link{display:block;border-radius:12px;transition:transform .15s}
+a.cover-link:hover{transform:scale(1.02)}
+.album .actions{position:absolute;top:8px;right:8px;display:flex;gap:6px}
+.album .icon-btn{width:32px;height:32px;background:rgb(0 0 0/.45);color:#fff;backdrop-filter:blur(4px)}
+.album .icon-btn:hover{background:rgb(0 0 0/.7);color:#fff}
+.album .meta{margin-top:8px}
+.title{font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sub{font-size:13px;color:var(--muted)}
+.album .sub{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.busy .sync-ico{animation:spin 1s linear infinite}
+@media (max-width:480px){header .btn-label{display:none}header .btn{padding:6px 10px}}
+@keyframes spin{to{transform:rotate(-360deg)}}
+.job{display:flex;gap:16px;align-items:flex-start;margin-bottom:12px}
+.jthumb{width:72px;height:72px;flex:none;object-fit:cover;border-radius:12px;background:var(--border)}
+.job .body{flex:1;min-width:0}
+.job .top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.pill{display:inline-block;padding:2px 10px;border-radius:999px;font-size:12px;font-weight:500;background:var(--border);color:var(--fg)}
+.pill.primary{background:var(--primary-soft);color:var(--primary)}
+.pill.success{background:var(--success-soft);color:var(--success)}
+.pill.danger{background:var(--danger-soft);color:var(--danger)}
+.pill.warning{background:var(--warning-soft);color:var(--warning)}
+.chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
+.bar{height:6px;background:var(--border);border-radius:999px;overflow:hidden;margin:10px 0 6px}
+.bar i{display:block;height:100%;background:var(--primary);border-radius:999px;transition:width .4s}
+.job a{display:inline-flex;align-items:center;gap:4px;margin-top:8px;font-weight:500}
+details{margin-top:8px}summary{cursor:pointer;color:var(--danger);font-size:14px}
+code{display:block;margin-top:6px;font:12px/1.5 ui-monospace,monospace;word-break:break-all;color:var(--muted)}
+.empty-state{padding:32px 20px;text-align:center;color:var(--muted)}
+</style></head><body>
+<header><img src="/logo" alt="" onerror="this.remove()"><h1>Google Photos Importer</h1>
+<a class="btn ghost sm" href="%%IMMICH%%"><span class="btn-label">Open Immich</span> %%OPEN%%</a></header>
+<main>
+<section><div class="head"><h2>Import a shared album</h2></div>
 <form class="card" method="post" action="/import">
 <label for="u">Shared album link</label>
-<input id="u" name="url" type="url" required placeholder="https://photos.app.goo.gl/…" value="{prefill}">
-<label for="n">Immich album name (optional — defaults to the Google album's name)</label>
+<input id="u" name="url" type="url" required placeholder="https://photos.app.goo.gl/…" value="%%PREFILL%%">
+<label for="n">Immich album name <span class="hint">· optional, defaults to the Google album's name</span></label>
 <input id="n" name="name" type="text" placeholder="e.g. Colorado 2026">
-<div class="row"><button name="mode" value="import">Import</button>
-<button class="alt" name="mode" value="preview">Preview only</button></div>
-</form>
-{saved}
-{jobs}
-</main></body></html>"""
+<div class="row"><button class="btn" name="mode" value="import">%%DOWNLOAD%% Import</button>
+<button class="btn ghost" name="mode" value="preview">%%EYE%% Preview</button></div>
+</form></section>
+<div id="live" data-active="%%ACTIVE%%">%%LIVE%%</div>
+</main>
+<script>
+// Refresh progress in place (a full page reload would wipe a link being typed)
+const live=document.getElementById('live');
+async function poll(){
+  try{const r=await fetch('/live',{cache:'no-store'});live.innerHTML=await r.text();
+    if(r.headers.get('X-Active')==='1')setTimeout(poll,3000)}
+  catch(e){setTimeout(poll,5000)}}
+if(live.dataset.active==='1')setTimeout(poll,3000);
+</script>
+</body></html>"""
+
+
+def saved_covers():
+    """Google album link -> cover asset id for albums imported before."""
+    covers = album_covers()
+    return {e["link"]: covers.get(e.get("immich_album")) or next(iter(e.get("items", {}).values()), None)
+            for e in load_state().values() if e.get("link")}
 
 
 def render_jobs():
+    link_cover = saved_covers()
     with jobs_lock:
         snapshot = sorted(jobs.values(), key=lambda j: j["t"], reverse=True)
         out = []
         for j in snapshot:
             pct = int(100 * j["done"] / j["total"]) if j["total"] else 0
-            parts = [f'<div class="card"><b>{html.escape(j["title"])}</b>'
-                     f'<div class="mute">{j["started"]} · {html.escape(j["state"])}</div>']
+            if j.get("error"):
+                status = pill("Failed", "danger")
+            elif not j["finished"]:
+                status = pill("Running", "primary")
+            elif j["preview"]:
+                status = pill("Preview")
+            elif j["failed"]:
+                status = pill(f"{len(j['failed'])} failed", "warning")
+            else:
+                status = pill("Done", "success")
+            parts = [f'<div class="card job">{thumb(j["asset_ids"][0] if j["asset_ids"] else link_cover.get(j["link"]), "jthumb")}<div class="body">'
+                     f'<div class="top"><span class="title">{html.escape(j["title"])}</span>{status}</div>'
+                     f'<div class="sub">{j["started"]} · {html.escape(j["state"])}</div>']
             if j["total"] and not j["preview"]:
                 parts.append(f'<div class="bar"><i style="width:{pct}%"></i></div>'
-                             f'<div class="mute">{j["done"]}/{j["total"]} · {j["created"]} new · '
+                             f'<div class="sub">{j["done"]} of {j["total"]} · {j["created"]} new · '
                              f'{j["dupes"]} already in Immich · {len(j["failed"])} failed</div>')
             if j["skipped"]:
-                parts.append(f'<div class="mute">{j["skipped"]} imported on an earlier run — skipped</div>')
+                parts.append(f'<div class="sub">{j["skipped"]} imported on an earlier run, skipped</div>')
             if j["finished"] and not j["total"] and j["skipped"] and not j.get("error"):
-                parts.append('<div class="mute">No new photos since the last import.</div>')
+                parts.append('<div class="sub">No new photos since the last import.</div>')
             if j["tagged"]:
-                parts.append(f'<div class="mute">Added “Taken by” to {j["tagged"]} photos</div>')
-            if j["preview"] and j.get("sample") is not None:
-                parts.append(f'<div class="mute">{j["total"]} items found. First few:</div><code>'
+                parts.append(f'<div class="sub">Added “Taken by” to {j["tagged"]} photos</div>')
+            if j["preview"] and j.get("sample"):
+                parts.append(f'<div class="sub">{j["total"]} items found. First few:</div><code>'
                              + html.escape(", ".join(j["sample"])) + "</code>")
             if j["contributors"]:
-                parts.append('<div class="mute">Taken by: ' + html.escape(
-                    ", ".join(f"{n} ({c})" for n, c in j["contributors"])) + "</div>")
+                parts.append('<div class="chips">' + "".join(
+                    pill(f"{n} · {c}") for n, c in j["contributors"]) + "</div>")
             if j.get("album_url"):
-                parts.append(f'<div style="margin-top:8px"><a href="{IMMICH_PUBLIC}{j["album_url"]}">'
-                             "Open album in Immich →</a></div>")
+                parts.append(f'<a href="{IMMICH_PUBLIC}{j["album_url"]}">Open album in Immich {icon("open", 16)}</a>')
             if j["failed"]:
-                parts.append('<details><summary class="err">Failures</summary><code>'
+                parts.append("<details><summary>Show failures</summary><code>"
                              + "<br>".join(html.escape(f) for f in j["failed"][:50]) + "</code></details>")
-            out.append("".join(parts) + "</div>")
+            out.append("".join(parts) + "</div></div>")
         active = any(not j["finished"] for j in snapshot)
-    return "".join(out), active
+        running = {j["link"] for j in snapshot if not j["finished"]}
+    if not out:
+        return "", active, running
+    return '<section><div class="head"><h2>Activity</h2></div>' + "".join(out) + "</section>", active, running
 
 
-def render_saved():
+def render_saved(running):
     saved = [(k, v) for k, v in load_state().items() if v.get("link")]
+    busy = sync_lock.locked()
+    sync_all = (f'<form method="post" action="/sync"><button class="btn ghost sm"{" disabled" if busy else ""}>'
+                f'{icon("sync", 18)} {"Checking…" if busy else "Sync all"}</button></form>')
     if not saved:
-        return ""
+        return ('<section><div class="head"><h2>Saved albums</h2></div><div class="card empty-state">'
+                "Albums you import show up here, so you can check them for new photos later.</div></section>")
     saved.sort(key=lambda kv: (kv[1].get("title") or "").lower())
-    rows = []
+    covers = saved_covers()
+    cards = []
     for album_id, e in saved:
         aid = html.escape(album_id)
-        rows.append(
-            f'<div class="album"><div><b>{html.escape(e.get("title") or "Untitled")}</b>'
-            f'<div class="mute">{len(e.get("items", {}))} photos · last checked {html.escape(e.get("synced", "?"))}</div></div>'
-            f'<form method="post" action="/sync"><input type="hidden" name="album" value="{aid}">'
-            f'<button class="alt">Sync</button></form>'
-            f'<form method="post" action="/forget"><input type="hidden" name="album" value="{aid}">'
-            f'<button class="alt" title="Stop tracking (keeps photos in Immich)">✕</button></form></div>'
+        title = html.escape(e.get("title") or "Untitled")
+        immich_album = e.get("immich_album")
+        cover = thumb(covers.get(e["link"]), "cover")
+        if immich_album:
+            cover = f'<a class="cover-link" href="{IMMICH_PUBLIC}/albums/{html.escape(immich_album)}">{cover}</a>'
+        n = len(e.get("items", {}))
+        cards.append(
+            f'<div class="album{" busy" if e.get("link") in running else ""}">{cover}<div class="meta">'
+            f'<div class="title" title="{title}">{title}</div>'
+            f'<div class="sub">{n} item{"s" if n != 1 else ""}</div>'
+            f'<div class="sub">Checked {html.escape(e.get("synced", "?"))}</div></div>'
+            f'<div class="actions"><form method="post" action="/sync"><input type="hidden" name="album" value="{aid}">'
+            f'<button class="icon-btn" title="Check for new photos" aria-label="Sync {title}">'
+            f'<span class="sync-ico" style="display:inline-flex">{icon("sync", 18)}</span></button></form>'
+            f'<form method="post" action="/forget" onsubmit="return confirm(\'Stop tracking this album? Its photos stay in Immich.\')">'
+            f'<input type="hidden" name="album" value="{aid}">'
+            f'<button class="icon-btn" title="Forget (keeps photos in Immich)" aria-label="Forget {title}">{icon("close", 18)}</button>'
+            "</form></div></div>"
         )
-    busy = sync_lock.locked()
-    button = ('<button disabled>Checking…</button>' if busy
-              else '<button>Check all saved albums for new photos</button>')
-    return (f'<div class="card"><b>Saved albums</b><form method="post" action="/sync" class="row">{button}</form>'
-            + "".join(rows) + "</div>")
+    return (f'<section><div class="head"><h2>Saved albums</h2>{sync_all}</div>'
+            f'<div class="grid">{"".join(cards)}</div></section>')
 
 
-IMMICH_PUBLIC = (os.environ.get("IMMICH_PUBLIC_URL") or IMMICH_URL).rstrip("/")
+def render_live():
+    jobs_html, active, running = render_jobs()
+    return jobs_html + render_saved(running), active or sync_lock.locked()
+
+
+_logo = {}
+
+
+def fetch_logo():
+    """Immich's own app icon, fetched once from the Immich server."""
+    if "data" not in _logo:
+        try:
+            with urllib.request.urlopen(f"{IMMICH_URL}/apple-icon-180.png", timeout=10) as r:
+                _logo["data"] = r.read()
+        except Exception:
+            return None
+    return _logo["data"]
 
 
 class Handler(BaseHTTPRequestHandler):
     def send(self, code, body, ctype="text/html; charset=utf-8", headers=None):
-        data = body.encode()
+        data = body if isinstance(body, bytes) else body.encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -543,24 +710,47 @@ class Handler(BaseHTTPRequestHandler):
         u = urllib.parse.urlparse(self.path)
         if u.path == "/health":
             return self.send(200, "ok", "text/plain")
+        if u.path == "/live":
+            body, active = render_live()
+            return self.send(200, body, headers={"X-Active": "1" if active else "0", "Cache-Control": "no-store"})
+        if u.path.startswith("/thumb/"):
+            return self.send_thumb(u.path[len("/thumb/"):])
+        if u.path == "/logo":
+            data = fetch_logo()
+            if not data:
+                return self.send(404, "not found", "text/plain")
+            return self.send(200, data, "image/png", {"Cache-Control": "max-age=86400"})
         if u.path != "/":
             return self.send(404, "not found", "text/plain")
         q = urllib.parse.parse_qs(u.query)
         # Accept ?url= or ?text= (Android share sheets put the link in free text).
         raw = (q.get("url") or q.get("text") or [""])[0]
         m = re.search(r"https://\S+", raw)
-        jobs_html, active = render_jobs()
-        refresh = '<meta http-equiv="refresh" content="3">' if active or sync_lock.locked() else ""
-        self.send(200, PAGE.format(refresh=refresh, prefill=html.escape(m.group(0) if m else ""),
-                                   saved=render_saved(), jobs=jobs_html))
+        live, active = render_live()
+        page = (PAGE.replace("%%IMMICH%%", html.escape(IMMICH_PUBLIC))
+                .replace("%%OPEN%%", icon("open", 16)).replace("%%DOWNLOAD%%", icon("download"))
+                .replace("%%EYE%%", icon("eye")).replace("%%ACTIVE%%", "1" if active else "0")
+                .replace("%%PREFILL%%", html.escape(m.group(0) if m else "")).replace("%%LIVE%%", live))
+        self.send(200, page)
+
+    def send_thumb(self, asset_id):
+        if not UUID_RE.fullmatch(asset_id):
+            return self.send(404, "not found", "text/plain")
+        req = urllib.request.Request(f"{IMMICH_URL}/api/assets/{asset_id}/thumbnail?size=thumbnail",
+                                     headers={"x-api-key": IMMICH_API_KEY})
+        try:
+            with urllib.request.urlopen(req, timeout=20) as r:
+                data, ctype = r.read(), r.headers.get("Content-Type", "image/jpeg")
+        except Exception:
+            return self.send(404, "not found", "text/plain")
+        self.send(200, data, ctype, {"Cache-Control": "private, max-age=86400"})
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         form = urllib.parse.parse_qs(self.rfile.read(length).decode())
         album = (form.get("album") or [""])[0]
         if self.path == "/sync":
-            if not sync_lock.locked():
-                sync_saved({album} if album else None)
+            sync_saved({album} if album else None)
             return self.send(303, "", headers={"Location": "/"})
         if self.path == "/forget":
             forget_album(album)
