@@ -1,0 +1,23 @@
+name: immich-google-importer
+
+services:
+  immich-google-importer:
+    container_name: immich-google-importer
+    # Builds straight from GitHub, so this file works on its own (including as a Portainer stack)
+    build: https://github.com/CKraft11/immich-google-importer.git#main
+    image: immich-google-importer:latest
+    environment:
+      # Address the container uses to reach Immich (include the port, no trailing /api)
+      IMMICH_URL: ${IMMICH_URL}
+      # Immich API key (Account Settings -> API Keys)
+      IMMICH_API_KEY: ${IMMICH_API_KEY}
+      # Optional: the Immich address your browser uses, for the "open album" links
+      IMMICH_PUBLIC_URL: ${IMMICH_PUBLIC_URL:-}
+      # Parallel downloads/uploads
+      WORKERS: ${WORKERS:-4}
+    volumes:
+      # Remembers what was imported per album so re-runs only fetch new photos
+      - ./data:/data
+    ports:
+      - "${PORT:-8098}:8080"
+    restart: unless-stopped
